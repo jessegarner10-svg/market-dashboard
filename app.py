@@ -1,0 +1,161 @@
+"""
+Live Market Data Dashboard (Streamlit)
+======================================
+Streamlit app to view live market and energy data from Yahoo Finance and EIA.
+
+Quickstart:
+------------
+1. Save this file as `app.py`
+2. Install dependencies: pip install -U streamlit yfinance plotly pandas numpy requests python-dateutil ta
+3. (Optional) Set your EIA API key:
+   - Windows (PowerShell):  $Env:EIA_API_KEY="YOUR_KEY"
+   - macOS/Linux:           export EIA_API_KEY="YOUR_KEY"
+4. Run: streamlit run app.py
+"""
+
+import os
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import requests
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import date, timedelta
+import streamlit as st
+from dateutil.relativedelta import relativedelta
+
+# ---------------- CONFIG ----------------
+st.set_page_config(page_title="Live Market Dashboard", page_icon="📈", layout="wide")
+
+# ---------------- SIDEBAR ----------------
+st.sidebar.header("Data Source")
+source = st.sidebar.radio("Choose source:", ["Yahoo Finance", "EIA"], index=0)
+
+today = date.today()
+default_start = today - relativedelta(years=1)
+start_date, end_date = st.sidebar.date_input("Date range", (default_start, today))
+
+# --- Yahoo settings ---
+if source == "Yahoo Finance":
+    tickers = st.sidebar.text_input(
+        "Enter tickers (comma-separated):",
+        value="CL=F, NG=F, ^GSPC, ^VIX, BTC-USD",
+        help="Examples: CL=F (WTI), NG=F (NatGas), ^GSPC (S&P 500), BTC-USD (Bitcoin)",
+    )
+    interval = st.sidebar.selectbox("Interval", ["1d", "1h", "30m", "15m", "5m"], index=0)
+
+# --- EIA settings ---
+else:
+    eia_series = st.sidebar.text_input(
+        "EIA Series ID:",
+        value="PET.RWTC.D",
+        help="Example: PET.RWTC.D (Cushing WTI Spot Price, Daily)",
+    )
+    api_key = os.getenv("EIA_API_KEY", "")
+    st.sidebar.caption("EIA API Key: " + ("✔️ loaded" if api_key else "⚠️ not set"))
+
+# ---------------- FETCH FUNCTIONS ----------------
+@st.cache_data(ttl=300)
+def fetch_yahoo(symbols, start, end, interval="1d"):
+    data = {}
+    for s in symbols:
+        try:
+            df = yf.download(s, start=start, end=end + timedelta(days=1), interval=interval)
+            if not df.empty:
+                df["Symbol"] = s
+                data[s] = df
+        except Exception as e:
+            st.warning(f"Failed for {s}: {e}")
+    return data
+
+@st.cache_data(ttl=300)
+def fetch_eia_series(series_id, api_key, start, end):
+    url = "https://api.eia.gov/series/"
+    params = {"series_id": series_id}
+    if api_key:
+        params["api_key"] = api_key
+    r = requests.get(url, params=params, timeout=30)
+    if r.status_code != 200:
+        return pd.DataFrame()
+    j = r.json()
+    if "series" not in j:
+        return pd.DataFrame()
+    data = j["series"][0]["data"]
+    df = pd.DataFrame(data, columns=["Date", "Value"])
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.sort_values("Date")
+    df = df[(df["Date"].dt.date >= start) & (df["Date"].dt.date <= end)]
+    return df
+
+# ---------------- LOAD DATA ----------------
+if source == "Yahoo Finance":
+    tickers_list = [t.strip() for t in tickers.split(",") if t.strip()]
+    data = fetch_yahoo(tickers_list, start_date, end_date, interval)
+    if not data:
+        st.error("No Yahoo data returned.")
+        st.stop()
+else:
+    df_eia = fetch_eia_series(eia_series, api_key, start_date, end_date)
+    if df_eia.empty:
+        st.error("No EIA data returned.")
+        st.stop()
+
+# ---------------- HEADER ----------------
+st.title("📊 Live Market Data Dashboard")
+st.caption(f"Source: {source} | Date range: {start_date} → {end_date}")
+
+# ---------------- MAIN CONTENT ----------------
+if source == "Yahoo Finance":
+    tab1, tab2, tab3 = st.tabs(["Chart", "Table", "Compare"])
+
+    with tab1:
+        symbol = st.selectbox("Choose symbol", list(data.keys()))
+        df = data[symbol]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name=f"{symbol} Close"))
+        fig.update_layout(title=f"{symbol} Price", height=500)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab2:
+        sym = st.selectbox("Table view symbol", list(data.keys()), key="table")
+        st.dataframe(data[sym])
+        st.download_button(
+            "Download CSV",
+            data[sym].to_csv().encode("utf-8"),
+            file_name=f"{sym}.csv",
+            mime="text/csv",
+        )
+
+    with tab3:
+        selected = st.multiselect("Compare tickers", list(data.keys()), default=list(data.keys())[:2])
+        if selected:
+            dfs = [data[s]["Close"].rename(s) for s in selected]
+            combined = pd.concat(dfs, axis=1).dropna()
+            norm = (combined / combined.iloc[0] - 1) * 100
+            fig2 = px.line(norm, labels={"value": "% Change", "index": "Date", "variable": "Ticker"})
+            st.plotly_chart(fig2, use_container_width=True)
+
+else:  # EIA
+    st.subheader(f"EIA Series: {eia_series}")
+    st.line_chart(df_eia.set_index("Date")["Value"])
+    st.download_button(
+        "Download CSV",
+        df_eia.to_csv().encode("utf-8"),
+        file_name=f"{eia_series}.csv",
+        mime="text/csv",
+    )
+
+# ---------------- ABOUT ----------------
+st.markdown("---")
+st.markdown(
+    """
+    ### ℹ️ About this App
+    - **Yahoo Finance:** Free, unofficial data via `yfinance`.
+    - **EIA:** Official U.S. Energy Information Administration Open Data API.
+    - Example EIA series:
+        - `PET.RWTC.D` → Cushing, OK WTI Spot Price (Daily)
+        - `NG.RNGWHHD.D` → Henry Hub Natural Gas Spot Price (Daily)
+    ---
+    **Note:** For educational/informational use only.
+    """
+)
