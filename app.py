@@ -175,9 +175,31 @@ if tab_choice == "EIA (Daily)":
         "Date range (daily)", (THREE_YEARS_AGO, TODAY)
     )
 
-    with st.spinner("Fetching EIA daily data…"):
-        df_eia = fetch_eia_series_daily(series_id, EIA_KEY, start_dt, end_dt)
-    has_data = not df_eia.empty
+  with st.spinner("Fetching EIA daily data…"):
+    df_eia, eia_info = fetch_eia_series_daily(series_id, EIA_KEY, start_dt, end_dt)
+has_data = not df_eia.empty
+
+with st.expander("EIA Diagnostics", expanded=False):
+    st.write({
+        "api_key_present": eia_info.get("api_key_present"),
+        "request_status": eia_info.get("status"),
+        "ok": eia_info.get("ok"),
+        "reason": eia_info.get("reason"),
+        "request_url": eia_info.get("url"),
+        "raw_error": eia_info.get("raw_error")[:500] if eia_info.get("raw_error") else ""
+    })
+
+   if st.button("Run EIA connectivity test (WTI daily)"):
+    test_series = "PET.RWTC.D"  # WTI Cushing spot daily
+    test_df, test_info = fetch_eia_series_daily(test_series, EIA_KEY, THREE_YEARS_AGO, TODAY)
+    st.write("Test result:", {
+        "ok": test_info.get("ok"),
+        "status": test_info.get("status"),
+        "reason": test_info.get("reason"),
+        "rows": len(test_df),
+    })
+    if not test_df.empty:
+        st.write(test_df.tail(5))
 
     st.subheader(f"{series_label}")
     st.caption(f"Window: {start_dt} → {end_dt}  |  Points: {len(df_eia)}")
