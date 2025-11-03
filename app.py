@@ -1,17 +1,21 @@
 """
-Live Market Data Dashboard (Streamlit) — with Forward Curve tab
----------------------------------------------------------------
-Sources: Yahoo Finance (free), EIA (official API).
+Market Analytics Dashboard — EIA Daily + Forward Curve
+------------------------------------------------------
+- Professional UI (no Yahoo tab)
+- EIA Daily (3y history) with strip builder (1M/3M, Seasonal, Calendar, Custom)
+- Forward Curve (WTI/Brent/Henry Hub) via free Yahoo futures contract tickers
 
-Quickstart:
-1) Save as app.py
-2) Streamlit Cloud will use requirements.txt to build
-3) Optional: add EIA key in Streamlit Secrets as EIA_API_KEY
+Setup (Streamlit Cloud):
+1) In app Settings → Secrets, add:
+   EIA_API_KEY = your_real_key_here
+2) requirements.txt already covers deps.
+
+Note: Data provided as-is for informational use.
 """
 
 import os
-from datetime import date, timedelta
-from typing import List, Dict, Tuple
+from datetime import date, timedelta, datetime
+from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -23,66 +27,50 @@ import streamlit as st
 from dateutil.relativedelta import relativedelta
 
 # ---------------- CONFIG ----------------
-st.set_page_config(page_title="Live Market Dashboard", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Market Analytics Dashboard", page_icon="📈", layout="wide")
 
-# ---------------- SIDEBAR ----------------
-st.sidebar.header("Data Source")
-source = st.sidebar.radio("Choose source:", ["Yahoo Finance", "EIA", "Forward Curve"], index=0)
+# ---------------- CONSTANTS ----------------
+MONTH_CODES = ["F","G","H","J","K","M","N","Q","U","V","X","Z"]  # Jan..Dec
+TODAY = date.today()
+THREE_YEARS_AGO = TODAY - relativedelta(years=3)
 
-today = date.today()
-default_start = today - relativedelta(years=1)
+# EIA series IDs (Daily):
+EIA_SERIES = {
+    "WTI (Cushing) — Daily": "PET.RWTC.D",       # WTI Spot, Daily
+    "Brent — Daily": "PET.RBRTE.D",              # Brent Spot, Daily
+    "Henry Hub — Daily": "NG.RNGWHHD.D",         # Henry Hub Spot, Daily
+}
 
-# Date input for non-curve tabs
-if source in ("Yahoo Finance", "EIA"):
-    start_date, end_date = st.sidebar.date_input("Date range", (default_start, today))
+# Seasons (generic energy desk conventions)
+SEASONS = {
+    "Summer (Apr–Oct)": [4,5,6,7,8,9,10],
+    "Winter (Nov–Mar)": [11,12,1,2,3],
+}
 
-# --- Yahoo settings ---
-if source == "Yahoo Finance":
-    tickers = st.sidebar.text_input(
-        "Enter tickers (comma-separated):",
-        value="CL=F, NG=F, ^GSPC, ^VIX, BTC-USD",
-        help="Examples: CL=F (WTI), NG=F (NatGas), ^GSPC (S&P 500), BTC-USD (Bitcoin)",
-    )
-    interval = st.sidebar.selectbox("Interval", ["1d", "1h", "30m", "15m", "5m"], index=0)
+# ---------------- HELPERS ----------------
+def parse_eia_period(p: str) -> pd.Timestamp:
+    """
+    Parse EIA period strings: YYYY, YYYYMM, YYYYMMDD, or ISO-like.
+    """
+    p = str(p)
+    if len(p) == 4 and p.isdigit():
+        # Yearly -> year-end
+        return pd.Timestamp(p) + pd.offsets.YearEnd(0)
+    if len(p) == 6 and p.isdigit():
+        # Monthly -> month-end
+        return pd.Timestamp(p[:4] + "-" + p[4:]) + pd.offsets.MonthEnd(0)
+    if len(p) == 8 and p.isdigit():
+        # Daily: YYYYMMDD
+        return pd.to_datetime(p, format="%Y%m%d", errors="coerce")
+    # Fallback
+    return pd.to_datetime(p, errors="coerce")
 
-# --- EIA settings ---
-elif source == "EIA":
-    eia_series = st.sidebar.text_input(
-        "EIA Series ID:",
-        value="PET.RWTC.D",
-        help="Example: PET.RWTC.D (Cushing WTI Spot Price, Daily)",
-    )
-    api_key = st.secrets.get("EIA_API_KEY", os.getenv("EIA_API_KEY", ""))
-    st.sidebar.caption("EIA API Key: " + ("✔️ loaded" if api_key else "⚠️ not set"))
-
-# --- Forward Curve settings ---
-else:
-    st.sidebar.subheader("Forward Curve Settings")
-    commodity = st.sidebar.selectbox(
-        "Commodity",
-        options=["WTI Crude (CL)", "Brent Crude (BZ)", "Henry Hub (NG)"],
-        index=0,
-        help="Uses Yahoo Finance individual contract tickers."
-    )
-    months_ahead = st.sidebar.slider("Months ahead", min_value=3, max_value=24, value=12)
-    st.sidebar.caption("Tip: increase months ahead for a longer curve.")
-
-# ---------------- FETCH FUNCTIONS ----------------
-@st.cache_data(ttl=300)
-def fetch_yahoo(symbols: List[str], start: date, end: date, interval="1d") -> Dict[str, pd.DataFrame]:
-    data = {}
-    for s in symbols:
-        try:
-            df = yf.download(s, start=start, end=end + timedelta(days=1), interval=interval, progress=False)
-            if not df.empty:
-                df["Symbol"] = s
-                data[s] = df
-        except Exception as e:
-            st.warning(f"Failed for {s}: {e}")
-    return data
-
-@st.cache_data(ttl=300)
-def fetch_eia_series(series_id: str, api_key: str, start: date, end: date) -> pd.DataFrame:
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_eia_series_daily(series_id: str, api_key: Optional[str], start: date, end: date) -> pd.DataFrame:
+    """
+    Fetch EIA series and clip to last 3y daily (or the given window).
+    Returns DataFrame columns: Date, Value.
+    """
     if not series_id:
         return pd.DataFrame()
     url = "https://api.eia.gov/series/"
@@ -95,52 +83,40 @@ def fetch_eia_series(series_id: str, api_key: str, start: date, end: date) -> pd
     j = r.json()
     if "series" not in j or not j["series"]:
         return pd.DataFrame()
-    data = j["series"][0]["data"]
+    data = j["series"][0].get("data", [])
     df = pd.DataFrame(data, columns=["Period", "Value"])
-
-    # Parse Period that may be YYYYMM, YYYY, or YYYY-MM-DD
-    def parse_period(p: str) -> pd.Timestamp:
-        p = str(p)
-        if len(p) == 4:
-            return pd.Timestamp(p) + pd.offsets.YearEnd(0)
-        if len(p) == 6:
-            return pd.Timestamp(p[:4] + "-" + p[4:]) + pd.offsets.MonthEnd(0)
-        return pd.to_datetime(p, errors="coerce")
-
-    df["Date"] = df["Period"].apply(parse_period)
+    df["Date"] = df["Period"].apply(parse_eia_period)
     df = df.dropna(subset=["Date"]).sort_values("Date")
     df = df[(df["Date"].dt.date >= start) & (df["Date"].dt.date <= end)]
-    return df[["Date", "Value"]]
+    df["Value"] = pd.to_numeric(df["Value"], errors="coerce")
+    df = df.dropna(subset=["Value"])
+    return df[["Date","Value"]].reset_index(drop=True)
 
-# ---------------- FORWARD CURVE HELPERS ----------------
-MONTH_CODES = ["F","G","H","J","K","M","N","Q","U","V","X","Z"]  # Jan..Dec
+def mm_to_num(code: str) -> int:
+    return MONTH_CODES.index(code) + 1
 
 def build_contract_list(root: str, months: int, start_date: date) -> List[Tuple[str, str]]:
     """
-    Build a list of (contract_code, pretty_label) like ('CLZ24', '2024-12') for the next `months`.
+    Build (contract_code, pretty_label) pairs, e.g. ('CLZ24', '2024-12').
+    Starts at current month; increase range to look further out the curve.
     """
     out = []
     y = start_date.year
     m = start_date.month
-    # start from current month; shift to next if you prefer next calendar month:
     for i in range(months):
         mm = (m - 1 + i) % 12
         yy = y + (m - 1 + i) // 12
         code = MONTH_CODES[mm]
-        yy2 = yy % 100  # 2-digit year
+        yy2 = yy % 100
         contract = f"{root}{code}{yy2:02d}"
         label = f"{yy}-{mm_to_num(code):02d}"
         out.append((contract, label))
     return out
 
-def mm_to_num(code: str) -> int:
-    return MONTH_CODES.index(code) + 1
-
 def try_yahoo_contract(symbol_base: str) -> pd.Series:
     """
     Try multiple Yahoo variants for a contract:
-    e.g., CLZ24, CLZ24.NYM  (keep first that has data)
-    Returns a Series with the last available Close price; empty if none.
+    e.g., CLZ24, CLZ24.NYM (returns last Close series if found)
     """
     candidates = [symbol_base, f"{symbol_base}.NYM"]
     for t in candidates:
@@ -155,119 +131,205 @@ def try_yahoo_contract(symbol_base: str) -> pd.Series:
             continue
     return pd.Series(dtype=float)
 
-def get_curve(root: str, months_ahead: int, ref_date: date) -> pd.DataFrame:
+def get_forward_curve(root: str, months_ahead: int, ref_date: date) -> pd.DataFrame:
     rows = []
     for contract, label in build_contract_list(root, months_ahead, ref_date):
         s = try_yahoo_contract(contract)
         if not s.empty:
             last_val = float(s.iloc[-1])
-            rows.append({"Contract": contract, "Label": label, "Price": last_val})
+            rows.append({"Contract": contract, "Delivery": label, "Price": last_val})
     df = pd.DataFrame(rows)
     if not df.empty:
-        # sort by Label (YYYY-MM)
-        df = df.sort_values("Label")
+        df = df.sort_values("Delivery")
     return df
 
-# ---------------- LOAD & RENDER ----------------
-st.title("📊 Live Market Data Dashboard")
+def strip_average(df_daily: pd.DataFrame, start_dt: date, end_dt: date) -> Optional[float]:
+    """
+    Average of daily 'Value' between start_dt and end_dt (inclusive).
+    """
+    if df_daily.empty:
+        return None
+    mask = (df_daily["Date"].dt.date >= start_dt) & (df_daily["Date"].dt.date <= end_dt)
+    sub = df_daily.loc[mask, "Value"].dropna()
+    if sub.empty:
+        return None
+    return float(sub.mean())
 
-if source == "Yahoo Finance":
-    st.caption(f"Source: Yahoo Finance | Date range: {start_date} → {end_date}")
-    data = fetch_yahoo([t.strip() for t in tickers.split(",") if t.strip()], start_date, end_date, interval)
-    if not data:
-        st.error("No Yahoo data returned.")
+def strip_label(start_dt: date, end_dt: date) -> str:
+    return f"{start_dt.isoformat()} → {end_dt.isoformat()}"
+
+# ---------------- SIDEBAR ----------------
+st.sidebar.header("Navigation")
+tab_choice = st.sidebar.radio(
+    "Choose a module:",
+    options=["EIA (Daily)", "Forward Curve"],
+    index=0,
+)
+
+# API key handling
+EIA_KEY = st.secrets.get("EIA_API_KEY", os.getenv("EIA_API_KEY", ""))
+with st.sidebar.expander("API Keys", expanded=False):
+    st.caption("EIA key is read from **Secrets** (preferred) or environment.")
+    if EIA_KEY:
+        st.success("EIA key loaded.")
+    else:
+        st.warning("No EIA key found. Add it in Settings → Secrets as `EIA_API_KEY`.")
+
+# ---------------- EIA DAILY ----------------
+if tab_choice == "EIA (Daily)":
+    st.title("EIA Daily — 3-Year History & Strips")
+    st.caption("Source: U.S. EIA Open Data API")
+    c1, c2 = st.columns([2,1])
+    with c1:
+        series_mode = st.radio("Series", ["WTI (Cushing) — Daily","Brent — Daily","Henry Hub — Daily","Custom (enter EIA series ID)"], horizontal=True)
+    with c2:
+        # Window is fixed to last 3 years by default (but allow override)
+        default_window = st.checkbox("Use last 3 years", value=True)
+    if series_mode == "Custom (enter EIA series ID)":
+        custom_series = st.text_input("EIA series ID", value="", placeholder="e.g., PET.RWTC.D")
+        series_id = custom_series.strip()
+        series_label = series_id or "Custom"
+    else:
+        series_id = EIA_SERIES[series_mode]
+        series_label = series_mode
+
+    if default_window:
+        start_dt, end_dt = THREE_YEARS_AGO, TODAY
+    else:
+        start_dt, end_dt = st.date_input("Date range (daily)", (THREE_YEARS_AGO, TODAY))
+
+    # Fetch
+    with st.spinner("Fetching EIA daily data…"):
+        df_eia = fetch_eia_series_daily(series_id, EIA_KEY, start_dt, end_dt)
+
+    if df_eia.empty:
+        st.error("No data returned. Check EIA key, series ID, or date window.")
         st.stop()
 
-    tab1, tab2, tab3 = st.tabs(["Chart", "Table", "Compare"])
+    st.subheader(f"{series_label}")
+    st.caption(f"Window: {start_dt} → {end_dt}  |  Points: {len(df_eia)}")
 
-    with tab1:
-        symbol = st.selectbox("Choose symbol", list(data.keys()))
-        df = data[symbol]
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name=f"{symbol} Close"))
-        fig.update_layout(title=f"{symbol} Price", height=500)
-        st.plotly_chart(fig, use_container_width=True)
+    # Chart
+    fig = px.line(df_eia, x="Date", y="Value", title=None, labels={"Value":"Price","Date":"Date"})
+    fig.update_layout(height=420, margin=dict(l=10,r=10,t=10,b=10))
+    st.plotly_chart(fig, use_container_width=True)
 
-    with tab2:
-        sym = st.selectbox("Table view symbol", list(data.keys()), key="table")
-        st.dataframe(data[sym])
+    # Table + download
+    with st.expander("Data (daily)", expanded=False):
+        st.dataframe(df_eia, use_container_width=True)
         st.download_button(
             "Download CSV",
-            data[sym].to_csv().encode("utf-8"),
-            file_name=f"{sym}.csv",
+            df_eia.to_csv(index=False).encode("utf-8"),
+            file_name=f"EIA_{series_id.replace('.','_')}_{start_dt}_{end_dt}.csv",
             mime="text/csv",
         )
 
-    with tab3:
-        selected = st.multiselect("Compare tickers", list(data.keys()), default=list(data.keys())[:2])
-        if selected:
-            dfs = [data[s]["Close"].rename(s) for s in selected]
-            combined = pd.concat(dfs, axis=1).dropna()
-            norm = (combined / combined.iloc[0] - 1) * 100
-            fig2 = px.line(norm, labels={"value": "% Change", "index": "Date", "variable": "Ticker"})
-            st.plotly_chart(fig2, use_container_width=True)
+    st.markdown("---")
+    st.subheader("Strip Builder")
 
-elif source == "EIA":
-    st.caption(f"Source: EIA | Date range: {start_date} → {end_date}")
-    df_eia = fetch_eia_series(eia_series, api_key, start_date, end_date)
-    if df_eia.empty:
-        st.error("No EIA data returned.")
-        st.stop()
-    st.subheader(f"EIA Series: {eia_series}")
-    st.line_chart(df_eia.set_index("Date")["Value"])
-    st.download_button(
-        "Download CSV",
-        df_eia.to_csv().encode("utf-8"),
-        file_name=f"{eia_series}.csv",
-        mime="text/csv",
+    # Strip controls
+    strip_type = st.radio(
+        "Strip type",
+        ["1 Month", "3 Month", "Seasonal", "Calendar Year", "Custom Range"],
+        horizontal=True
     )
 
-else:  # Forward Curve
-    st.caption("Source: Yahoo Finance individual futures contracts (free)")
-    # Map display -> root
-    root = {"WTI Crude (CL)": "CL", "Brent Crude (BZ)": "BZ", "Henry Hub (NG)": "NG"}[commodity]
-    st.subheader(f"Forward Curve — {commodity}")
-    with st.spinner("Fetching contract months..."):
-        df_curve = get_curve(root=root, months_ahead=months_ahead, ref_date=today)
+    # Helper: get month span from anchor
+    latest_date = df_eia["Date"].max().date()
+    def end_of_month(d: date) -> date:
+        first_next = (pd.Timestamp(d) + pd.offsets.MonthEnd(0)).date()
+        return first_next
 
-    if df_curve.empty:
-        st.warning(
-            "No contract data found yet. Try reducing months ahead, or switch commodity. "
-            "If this persists, Yahoo may not list some contract symbols; we’ll expand the symbol search in the next iteration."
-        )
+    if strip_type == "1 Month":
+        anchor = st.date_input("Anchor month", value=date(latest_date.year, latest_date.month, 1))
+        start_strip = date(anchor.year, anchor.month, 1)
+        end_strip = end_of_month(start_strip)
+
+    elif strip_type == "3 Month":
+        anchor = st.date_input("Anchor (first month of strip)", value=date(latest_date.year, latest_date.month, 1))
+        # 3 consecutive months
+        end_m = anchor + relativedelta(months=2)
+        start_strip = date(anchor.year, anchor.month, 1)
+        end_strip = end_of_month(date(end_m.year, end_m.month, 1))
+
+    elif strip_type == "Seasonal":
+        season_name = st.selectbox("Season", list(SEASONS.keys()), index=0)
+        year = st.number_input("Contract year", min_value=2000, max_value=2100, value=latest_date.year)
+        months = SEASONS[season_name]
+        # Build start/end from months list (note: Winter spans years)
+        months_sorted = sorted(months, key=lambda m: (m<months[0], m))  # keep order roughly as defined
+        first_m = months_sorted[0]
+        last_m = months_sorted[-1]
+        if season_name.startswith("Winter"):
+            # Nov–Mar spans two years: Nov–Dec of (year-1) + Jan–Mar of (year)
+            start_strip = date(year-1, 11, 1)
+            end_strip = end_of_month(date(year, 3, 1))
+        else:
+            # Summer Apr–Oct, single year
+            start_strip = date(year, 4, 1)
+            end_strip = end_of_month(date(year, 10, 1))
+
+    elif strip_type == "Calendar Year":
+        cal_year = st.number_input("Year", min_value=2000, max_value=2100, value=latest_date.year)
+        start_strip = date(cal_year, 1, 1)
+        end_strip = date(cal_year, 12, 31)
+
+    else:  # Custom Range
+        start_strip, end_strip = st.date_input("Custom strip window", (latest_date.replace(day=1), latest_date))
+
+    # Compute average
+    avg = strip_average(df_eia, start_strip, end_strip)
+    if avg is None:
+        st.warning("No data points in the selected strip window.")
     else:
-        # Chart
+        st.success(f"Strip: {strip_label(start_strip, end_strip)}  •  **Average: {avg:,.4f}**")
+        # Show monthly breakdown table for clarity
+        # Group daily into months intersecting the strip
+        df_in = df_eia[(df_eia["Date"].dt.date >= start_strip) & (df_eia["Date"].dt.date <= end_strip)].copy()
+        if not df_in.empty:
+            df_in["YearMonth"] = df_in["Date"].dt.to_period("M")
+            monthly = df_in.groupby("YearMonth")["Value"].mean().reset_index()
+            monthly["YearMonth"] = monthly["YearMonth"].astype(str)
+            st.caption("Monthly averages within strip")
+            st.dataframe(monthly, use_container_width=True)
+
+# ---------------- FORWARD CURVE ----------------
+else:
+    st.title("Forward Curve (Free Contracts)")
+    st.caption("Source: Yahoo individual futures contracts (best-effort)")
+
+    commodity = st.selectbox(
+        "Commodity",
+        options=["WTI Crude (CL)", "Brent Crude (BZ)", "Henry Hub (NG)"],
+        index=0
+    )
+    months_ahead = st.slider("Months ahead", min_value=3, max_value=24, value=12)
+    root = {"WTI Crude (CL)":"CL", "Brent Crude (BZ)":"BZ", "Henry Hub (NG)":"NG"}[commodity]
+
+    with st.spinner("Building curve…"):
+        curve = get_forward_curve(root, months_ahead, TODAY)
+
+    if curve.empty:
+        st.warning("No contract data returned. Try fewer months or a different commodity.")
+    else:
         fig = px.line(
-            df_curve,
-            x="Label",
-            y="Price",
+            curve, x="Delivery", y="Price",
             markers=True,
-            title=f"{commodity} — Term Structure",
-            labels={"Label": "Delivery Month (YYYY-MM)", "Price": "Price"},
+            labels={"Delivery":"Delivery Month (YYYY-MM)", "Price":"Price"},
+            title=None
         )
         fig.update_traces(mode="lines+markers")
+        fig.update_layout(height=420, margin=dict(l=10,r=10,t=10,b=10))
         st.plotly_chart(fig, use_container_width=True)
 
-        # Table + download
-        st.dataframe(df_curve, use_container_width=True)
+        st.dataframe(curve, use_container_width=True)
         st.download_button(
             "Download Curve CSV",
-            df_curve.to_csv(index=False).encode("utf-8"),
+            curve.to_csv(index=False).encode("utf-8"),
             file_name=f"{root}_forward_curve.csv",
             mime="text/csv",
         )
 
-# ---------------- ABOUT ----------------
+# ---------------- FOOTER ----------------
 st.markdown("---")
-st.markdown(
-    """
-    ### ℹ️ About this App
-    - **Yahoo Finance:** Free, unofficial data via `yfinance`. Individual contracts are queried like `CLZ24` or `CLZ24.NYM`; whichever returns data is used.
-    - **EIA:** Official U.S. Energy Information Administration Open Data API (set `EIA_API_KEY` in Streamlit Secrets).
-    - Example EIA series:
-        - `PET.RWTC.D` → Cushing, OK WTI Spot Price (Daily)
-        - `NG.RNGWHHD.D` → Henry Hub Natural Gas Spot Price (Daily)
-    ---
-    **Note:** For educational/informational use only.
-    """
-)
+st.caption("© Market Analytics Dashboard — For informational use only. Data sources: EIA Open Data, Yahoo Finance.")
