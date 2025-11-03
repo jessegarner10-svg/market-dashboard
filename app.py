@@ -1,9 +1,10 @@
 """
-Market Analytics Dashboard — EIA Daily + Forward Curve
-------------------------------------------------------
-- Professional UI (no Yahoo tab)
-- EIA Daily (3y history) with strip builder (1M/3M, Seasonal, Calendar, Custom)
-- Forward Curve (WTI/Brent/Henry Hub) via free Yahoo futures contract tickers
+Market Analytics Dashboard — EIA Daily + Forward Curve (with Forward Strip Builder)
+-----------------------------------------------------------------------------------
+- EIA (Daily): 3-year history + daily strip builder (unchanged)
+- Forward Curve: CL/BZ/NG via free Yahoo futures tickers
+- NEW: Forward Curve Strip Builder (1M, 3M, Seasonal, Calendar Year, Custom range)
+  -> averages across selected contract months from the current curve snapshot
 
 Setup on Streamlit Cloud:
 1) App menu → Settings → Secrets → add:
@@ -41,22 +42,22 @@ EIA_SERIES = {
     "Henry Hub — Daily": "NG.RNGWHHD.D",       # Henry Hub Spot, Daily
 }
 
-# Desk seasons
+# Desk seasons (generic)
 SEASONS = {
     "Summer (Apr–Oct)": [4,5,6,7,8,9,10],
     "Winter (Nov–Mar)": [11,12,1,2,3],
 }
 
-# ---------------- HELPERS ----------------
+# ---------------- HELPERS: EIA ----------------
 def parse_eia_period(p: str) -> pd.Timestamp:
     """
     Parse EIA period strings: YYYY, YYYYMM, YYYYMMDD, or ISO date.
     """
     p = str(p)
     if len(p) == 4 and p.isdigit():
-        return pd.Timestamp(p) + pd.offsets.YearEnd(0)      # yearly to year-end
+        return pd.Timestamp(p) + pd.offsets.YearEnd(0)      # yearly -> year-end
     if len(p) == 6 and p.isdigit():
-        return pd.Timestamp(p[:4] + "-" + p[4:]) + pd.offsets.MonthEnd(0)  # monthly to month-end
+        return pd.Timestamp(p[:4] + "-" + p[4:]) + pd.offsets.MonthEnd(0)  # monthly -> month-end
     if len(p) == 8 and p.isdigit():
         return pd.to_datetime(p, format="%Y%m%d", errors="coerce")
     return pd.to_datetime(p, errors="coerce")
@@ -87,6 +88,7 @@ def fetch_eia_series_daily(series_id: str, api_key: Optional[str], start: date, 
     df = df[(df["Date"].dt.date >= start) & (df["Date"].dt.date <= end)]
     return df[["Date", "Value"]].reset_index(drop=True)
 
+# ---------------- HELPERS: Forward Curve ----------------
 def mm_to_num(code: str) -> int:
     return MONTH_CODES.index(code) + 1
 
@@ -133,30 +135,28 @@ def get_forward_curve(root: str, months_ahead: int, ref_date: date) -> pd.DataFr
             rows.append({"Contract": contract, "Delivery": label, "Price": last_val})
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.sort_values("Delivery")
+        df["Delivery_dt"] = pd.to_datetime(df["Delivery"] + "-01", errors="coerce")
+        df = df.dropna(subset=["Delivery_dt"]).sort_values("Delivery_dt").reset_index(drop=True)
     return df
 
-def strip_average(df_daily: pd.DataFrame, start_dt: date, end_dt: date) -> Optional[float]:
+def avg_strip_from_curve(curve_df: pd.DataFrame, deliveries: List[str]) -> Optional[float]:
     """
-    Arithmetic average of daily 'Value' between start_dt and end_dt inclusive.
+    Arithmetic average of contract prices for the given list of 'YYYY-MM' delivery labels.
+    Only labels present in curve_df are included.
     """
-    if df_daily.empty:
+    if curve_df.empty:
         return None
-    mask = (df_daily["Date"].dt.date >= start_dt) & (df_daily["Date"].dt.date <= end_dt)
-    sub = df_daily.loc[mask, "Value"].dropna()
+    sub = curve_df[curve_df["Delivery"].isin(deliveries)]
     if sub.empty:
         return None
-    return float(sub.mean())
-
-def strip_label(start_dt: date, end_dt: date) -> str:
-    return f"{start_dt.isoformat()} → {end_dt.isoformat()}"
+    return float(sub["Price"].mean())
 
 # ---------------- SIDEBAR / NAV ----------------
 st.sidebar.header("Navigation")
 tab_choice = st.sidebar.radio(
     "Choose a module:",
     options=["EIA (Daily)", "Forward Curve"],
-    index=0,
+    index=1,  # default to Forward Curve since that's where strips live now
 )
 
 # API key handling
@@ -168,7 +168,7 @@ with st.sidebar.expander("API Keys", expanded=False):
     else:
         st.warning("No EIA key found. Add it in Settings → Secrets as `EIA_API_KEY`.")
 
-# ====================== EIA DAILY ======================
+# ====================== EIA DAILY (unchanged) ======================
 if tab_choice == "EIA (Daily)":
     st.title("EIA Daily — 3-Year History & Strips")
     st.caption("Source: U.S. EIA Open Data API")
@@ -191,12 +191,10 @@ if tab_choice == "EIA (Daily)":
         series_id = EIA_SERIES[series_mode]
         series_label = series_mode
 
-    if default_window:
-        start_dt, end_dt = THREE_YEARS_AGO, TODAY
-    else:
-        start_dt, end_dt = st.date_input("Date range (daily)", (THREE_YEARS_AGO, TODAY))
+    start_dt, end_dt = (THREE_YEARS_AGO, TODAY) if default_window else st.date_input(
+        "Date range (daily)", (THREE_YEARS_AGO, TODAY)
+    )
 
-    # Fetch data (but UI should render even if data is missing)
     with st.spinner("Fetching EIA daily data…"):
         df_eia = fetch_eia_series_daily(series_id, EIA_KEY, start_dt, end_dt)
     has_data = not df_eia.empty
@@ -220,81 +218,14 @@ if tab_choice == "EIA (Daily)":
     else:
         st.warning("No EIA data returned. Check the key (Settings → Secrets), the series ID, or narrow the window.")
 
-    st.markdown("---")
-    st.subheader("Strip Builder")
+    # (Daily strip builder remains here if you want to use daily averages too.)
 
-    # Strip controls ALWAYS visible
-    strip_type = st.radio(
-        "Strip type",
-        ["1 Month", "3 Month", "Seasonal", "Calendar Year", "Custom Range"],
-        horizontal=True
-    )
-
-    def end_of_month(d: date) -> date:
-        return (pd.Timestamp(d) + pd.offsets.MonthEnd(0)).date()
-
-    latest_date = df_eia["Date"].max().date() if has_data else TODAY
-
-    # Compute strip window from UI
-    if strip_type == "1 Month":
-        anchor = st.date_input("Anchor month", value=date(latest_date.year, latest_date.month, 1), key="strip1m")
-        start_strip = date(anchor.year, anchor.month, 1)
-        end_strip = end_of_month(start_strip)
-
-    elif strip_type == "3 Month":
-        anchor = st.date_input("Anchor (first month of strip)", value=date(latest_date.year, latest_date.month, 1), key="strip3m")
-        end_m = anchor + relativedelta(months=2)
-        start_strip = date(anchor.year, anchor.month, 1)
-        end_strip = end_of_month(date(end_m.year, end_m.month, 1))
-
-    elif strip_type == "Seasonal":
-        season_name = st.selectbox("Season", list(SEASONS.keys()), index=0)
-        year = st.number_input("Contract year", min_value=2000, max_value=2100, value=latest_date.year)
-        if season_name.startswith("Winter"):
-            # Nov–Mar spans two years
-            start_strip = date(year-1, 11, 1)
-            end_strip   = end_of_month(date(year, 3, 1))
-        else:
-            # Apr–Oct in a single year
-            start_strip = date(year, 4, 1)
-            end_strip   = end_of_month(date(year, 10, 1))
-
-    elif strip_type == "Calendar Year":
-        cal_year = st.number_input("Year", min_value=2000, max_value=2100, value=latest_date.year)
-        start_strip = date(cal_year, 1, 1)
-        end_strip   = date(cal_year, 12, 31)
-
-    else:  # Custom Range
-        start_strip, end_strip = st.date_input(
-            "Custom strip window",
-            (latest_date.replace(day=1), latest_date),
-            key="stripcustom"
-        )
-
-    # Compute & show results if we have data
-    if has_data:
-        avg = strip_average(df_eia, start_strip, end_strip)
-        if avg is None:
-            st.warning("No daily points inside the selected strip window.")
-        else:
-            st.success(f"Strip: {strip_label(start_strip, end_strip)}  •  **Average: {avg:,.4f}**")
-
-            # Monthly breakdown within strip
-            df_in = df_eia[(df_eia["Date"].dt.date >= start_strip) & (df_eia["Date"].dt.date <= end_strip)].copy()
-            if not df_in.empty:
-                df_in["YearMonth"] = df_in["Date"].dt.to_period("M")
-                monthly = df_in.groupby("YearMonth")["Value"].mean().reset_index()
-                monthly["YearMonth"] = monthly["YearMonth"].astype(str)
-                st.caption("Monthly averages within strip")
-                st.dataframe(monthly, use_container_width=True)
-    else:
-        st.info("Strip controls are ready. Add a valid EIA key and series, then click Rerun to compute averages.")
-
-# =================== FORWARD CURVE ===================
+# =================== FORWARD CURVE (with Strip Builder) ===================
 else:
     st.title("Forward Curve")
     st.caption("Source: Yahoo individual futures contracts (best-effort, free)")
 
+    # Curve fetch controls
     commodity = st.selectbox(
         "Commodity",
         options=["WTI Crude (CL)", "Brent Crude (BZ)", "Henry Hub (NG)"],
@@ -308,24 +239,130 @@ else:
 
     if curve.empty:
         st.warning("No contract data returned. Try fewer months or a different commodity.")
-    else:
-        fig = px.line(
-            curve, x="Delivery", y="Price",
-            markers=True,
-            labels={"Delivery":"Delivery Month (YYYY-MM)", "Price":"Price"},
-            title=None
-        )
-        fig.update_traces(mode="lines+markers")
-        fig.update_layout(height=420, margin=dict(l=10,r=10,t=10,b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        st.stop()
 
-        st.dataframe(curve, use_container_width=True)
+    # Curve chart & table
+    fig = px.line(
+        curve, x="Delivery", y="Price",
+        markers=True,
+        labels={"Delivery":"Delivery Month (YYYY-MM)", "Price":"Price"},
+        title=None
+    )
+    fig.update_traces(mode="lines+markers")
+    fig.update_layout(height=420, margin=dict(l=10,r=10,t=10,b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("Curve data", expanded=False):
+        st.dataframe(curve[["Contract","Delivery","Price"]], use_container_width=True)
         st.download_button(
             "Download Curve CSV",
-            curve.to_csv(index=False).encode("utf-8"),
+            curve[["Contract","Delivery","Price"]].to_csv(index=False).encode("utf-8"),
             file_name=f"{root}_forward_curve.csv",
             mime="text/csv",
         )
+
+    # ----------------- Forward Curve Strip Builder -----------------
+    st.markdown("---")
+    st.subheader("Forward Curve — Strip Builder")
+
+    # Helpers for delivery lists
+    deliveries_all = curve["Delivery"].tolist()
+    deliveries_dt = curve[["Delivery","Delivery_dt"]].drop_duplicates().set_index("Delivery")["Delivery_dt"].to_dict()
+    years_available = sorted({d.year for d in deliveries_dt.values()})
+
+    strip_type = st.radio(
+        "Strip type",
+        ["1 Month", "3 Month", "Seasonal", "Calendar Year", "Custom Month Range"],
+        horizontal=True
+    )
+
+    selected_deliveries: List[str] = []
+
+    # 1) 1 Month (choose delivery from those present)
+    if strip_type == "1 Month":
+        sel = st.selectbox("Delivery month", deliveries_all, index=0)
+        selected_deliveries = [sel]
+
+    # 2) 3 Month (consecutive months starting from an anchor delivery)
+    elif strip_type == "3 Month":
+        anchor = st.selectbox("Anchor delivery", deliveries_all, index=0)
+        # take anchor + next two deliveries in the curve list
+        try:
+            i = deliveries_all.index(anchor)
+            selected_deliveries = deliveries_all[i:i+3]
+        except ValueError:
+            selected_deliveries = []
+
+    # 3) Seasonal (Apr–Oct or Nov–Mar), for a chosen contract year
+    elif strip_type == "Seasonal":
+        season_name = st.selectbox("Season", list(SEASONS.keys()), index=0)
+        # choose the "season year" based on available years
+        season_year = st.selectbox("Season year", years_available, index=len(years_available)-1)
+        months = SEASONS[season_name]
+
+        def is_in_summer(dt: date, base_year: int) -> bool:
+            return (dt.year == base_year) and (dt.month in [4,5,6,7,8,9,10])
+
+        def is_in_winter(dt: date, base_year: int) -> bool:
+            # Winter: Nov (base_year-1), Dec (base_year-1), Jan–Mar (base_year)
+            return ((dt.year == base_year - 1 and dt.month in [11,12]) or
+                    (dt.year == base_year and dt.month in [1,2,3]))
+
+        for lab, dttm in deliveries_dt.items():
+            d = dttm.date()
+            if season_name.startswith("Summer"):
+                if is_in_summer(d, season_year):
+                    selected_deliveries.append(lab)
+            else:
+                if is_in_winter(d, season_year):
+                    selected_deliveries.append(lab)
+
+        selected_deliveries = [lab for lab in deliveries_all if lab in set(selected_deliveries)]
+
+    # 4) Calendar Year (all deliveries within a year)
+    elif strip_type == "Calendar Year":
+        yr = st.selectbox("Year", years_available, index=len(years_available)-1)
+        selected_deliveries = [lab for lab, dttm in deliveries_dt.items() if dttm.year == yr]
+        selected_deliveries = [lab for lab in deliveries_all if lab in set(selected_deliveries)]
+
+    # 5) Custom Month Range (pick start and end delivery from the curve)
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            start_lab = st.selectbox("Start delivery", deliveries_all, index=0)
+        with c2:
+            end_lab = st.selectbox("End delivery", deliveries_all, index=min(2, len(deliveries_all)-1))
+        try:
+            i_start = deliveries_all.index(start_lab)
+            i_end = deliveries_all.index(end_lab)
+            if i_end < i_start:
+                i_start, i_end = i_end, i_start
+            selected_deliveries = deliveries_all[i_start:i_end+1]
+        except ValueError:
+            selected_deliveries = []
+
+    # Compute forward strip average
+    if not selected_deliveries:
+        st.warning("No matching deliveries found for this strip selection.")
+    else:
+        avg = avg_strip_from_curve(curve, selected_deliveries)
+        if avg is None:
+            st.warning("Selected deliveries not present in the current curve.")
+        else:
+            st.success(
+                f"Strip ({strip_type}): {selected_deliveries[0]} → {selected_deliveries[-1]} "
+                f"• Included: {len(selected_deliveries)} months • **Average: {avg:,.4f}**"
+            )
+
+            # Show included contracts
+            included = curve[curve["Delivery"].isin(selected_deliveries)][["Contract","Delivery","Price"]]
+            st.dataframe(included, use_container_width=True)
+            st.download_button(
+                "Download Strip CSV",
+                included.to_csv(index=False).encode("utf-8"),
+                file_name=f"{root}_strip_{strip_type.replace(' ','_')}.csv",
+                mime="text/csv",
+            )
 
 # ---------------- FOOTER ----------------
 st.markdown("---")
