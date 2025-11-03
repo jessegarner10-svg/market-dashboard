@@ -1,8 +1,8 @@
 """
-Market Analytics Dashboard — EIA Daily + Forward Curve (with EIA diagnostics)
------------------------------------------------------------------------------
-- EIA (Daily): 3y history + diagnostics + connectivity test + strip builder (1M/3M/Seasonal/Calendar/Custom)
-- Forward Curve: CL/BZ/NG via free Yahoo futures contract tickers + forward strip builder
+Market Analytics Dashboard — EIA Daily (v2) + Forward Curve
+-----------------------------------------------------------
+- EIA (Daily): uses EIA API v2 seriesid endpoint, with diagnostics + connectivity test
+- Forward Curve: CL/BZ/NG via free Yahoo futures contract tickers + strip builder
 
 Setup on Streamlit Cloud:
 1) App Settings → Secrets → TOML:
@@ -19,7 +19,6 @@ import pandas as pd
 import requests
 import yfinance as yf
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 from dateutil.relativedelta import relativedelta
 
@@ -31,7 +30,7 @@ MONTH_CODES = ["F","G","H","J","K","M","N","Q","U","V","X","Z"]  # Jan..Dec
 TODAY = date.today()
 THREE_YEARS_AGO = TODAY - relativedelta(years=3)
 
-# EIA Daily series IDs (spot/daily)
+# EIA Daily series IDs (v1-style IDs are still valid with v2/seriesid/)
 EIA_SERIES = {
     "WTI (Cushing) — Daily": "PET.RWTC.D",
     "Brent — Daily": "PET.RBRTE.D",
@@ -44,24 +43,29 @@ SEASONS = {
     "Winter (Nov–Mar)": [11,12,1,2,3],
 }
 
-# ---------------- HELPERS: EIA ----------------
-def _parse_eia_period(p: str) -> pd.Timestamp:
-    """Parse EIA period strings: YYYY, YYYYMM, YYYYMMDD, or ISO-like."""
+# ---------------- HELPERS: EIA (v2) ----------------
+def _parse_eia_period_v2(p: str) -> pd.Timestamp:
+    """
+    EIA v2 'period' values can be 'YYYY', 'YYYY-MM', 'YYYY-MM-DD'.
+    """
     p = str(p)
-    if len(p) == 8 and p.isdigit():   # daily
-        return pd.to_datetime(p, format="%Y%m%d", errors="coerce")
-    if len(p) == 6 and p.isdigit():   # monthly
-        return pd.to_datetime(p[:4] + "-" + p[4:] + "-01", errors="coerce") + pd.offsets.MonthEnd(0)
-    if len(p) == 4 and p.isdigit():   # yearly
+    # Normalize to a date for charting: monthly -> month-end, yearly -> Dec 31
+    if len(p) == 10:  # YYYY-MM-DD
+        return pd.to_datetime(p, format="%Y-%m-%d", errors="coerce")
+    if len(p) == 7:   # YYYY-MM
+        return pd.to_datetime(p + "-01", errors="coerce") + pd.offsets.MonthEnd(0)
+    if len(p) == 4:   # YYYY
         return pd.to_datetime(p + "-12-31", errors="coerce")
     return pd.to_datetime(p, errors="coerce")
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_eia_series_daily(series_id: str, api_key: Optional[str], start: date, end: date):
     """
-    Fetch EIA series via v1 endpoint and return (df, info).
-    df: DataFrame with columns [Date, Value] (or empty)
-    info: diagnostics dict {ok, status, url, reason, api_key_present, raw_error}
+    Fetch EIA series via v2 backward-compat endpoint:
+      https://api.eia.gov/v2/seriesid/{series_id}?api_key=...
+    Returns (df, info):
+      - df: DataFrame with columns [Date, Value] or empty
+      - info: diagnostics dict
     """
     info: Dict[str, object] = {
         "ok": False, "status": None, "url": "", "reason": "",
@@ -71,15 +75,20 @@ def fetch_eia_series_daily(series_id: str, api_key: Optional[str], start: date, 
         info["reason"] = "No series_id provided."
         return pd.DataFrame(), info
 
-    url = "https://api.eia.gov/series/"
-    params = {"series_id": series_id}
+    base = f"https://api.eia.gov/v2/seriesid/{series_id}"
+    params = {}
     if api_key:
         params["api_key"] = api_key
 
-    info["url"] = f"{url}?series_id={series_id}" + ("&api_key=***" if api_key else "")
+    # v2 supports start/end; send them in ISO (best effort).
+    # For daily series, YYYY-MM-DD; monthly/annual also accepted.
+    params["start"] = start.isoformat()
+    params["end"] = end.isoformat()
+
+    info["url"] = base + "?start=" + params["start"] + "&end=" + params["end"] + ("&api_key=***" if api_key else "")
 
     try:
-        r = requests.get(url, params=params, timeout=30)
+        r = requests.get(base, params=params, timeout=30)
         info["status"] = r.status_code
         if r.status_code != 200:
             info["reason"] = f"HTTP {r.status_code}"
@@ -90,30 +99,57 @@ def fetch_eia_series_daily(series_id: str, api_key: Optional[str], start: date, 
             return pd.DataFrame(), info
 
         j = r.json()
+        # v2 error surface
         if "error" in j:
             info["reason"] = "API error"
             info["raw_error"] = str(j["error"])[:500]
             return pd.DataFrame(), info
 
-        if "series" not in j or not j["series"]:
-            info["reason"] = "No 'series' in response"
+        # v2 success typically has: { "response": { "data": [...] } }
+        resp = j.get("response", {})
+        data = resp.get("data", [])
+        if not isinstance(data, list) or len(data) == 0:
+            info["reason"] = "Empty data"
             info["raw_error"] = str(j)[:500]
             return pd.DataFrame(), info
 
-        data = j["series"][0].get("data", [])
-        if not data:
-            info["reason"] = "Empty 'data' array"
+        # v2 fields commonly: period, value (sometimes VALUE uppercase). Normalize.
+        # Build DataFrame with 'period' and 'value'-ish fields.
+        df = pd.DataFrame(data)
+        # Find the value column
+        val_col = None
+        for cand in ["value", "Value", "VALUE"]:
+            if cand in df.columns:
+                val_col = cand
+                break
+        if val_col is None:
+            # Some series return specific measure column; fallback by picking first numeric column other than 'period'
+            numeric_cols = [c for c in df.columns if c.lower() != "period" and pd.api.types.is_numeric_dtype(df[c])]
+            if numeric_cols:
+                val_col = numeric_cols[0]
+            else:
+                info["reason"] = "No numeric value column found"
+                info["raw_error"] = str(df.columns.tolist())
+                return pd.DataFrame(), info
+
+        if "period" not in df.columns:
+            info["reason"] = "Missing 'period' in response"
+            info["raw_error"] = str(df.columns.tolist())
             return pd.DataFrame(), info
 
-        df = pd.DataFrame(data, columns=["Period", "Value"])
-        df["Date"] = df["Period"].apply(_parse_eia_period)
-        df["Value"] = pd.to_numeric(df["Value"], errors="coerce")
-        df = df.dropna(subset=["Date", "Value"]).sort_values("Date")
+        df["Date"] = df["period"].apply(_parse_eia_period_v2)
+        df["Value"] = pd.to_numeric(df[val_col], errors="coerce")
+        df = df.dropna(subset=["Date", "Value"])
 
-        # Clip to requested window
-        df = df[(df["Date"].dt.date >= start) & (df["Date"].dt.date <= end)].reset_index(drop=True)
+        # EIA v2 often returns newest first; sort ascending
+        df = df.sort_values("Date").reset_index(drop=True)
 
-        info["ok"] = True
+        # Clip (server should already filter, but keep a local guard)
+        df = df[(df["Date"].dt.date >= start) & (df["Date"].dt.date <= end)]
+
+        info["ok"] = not df.empty
+        if df.empty:
+            info["reason"] = "No rows after filtering (check date window/series frequency)."
         return df[["Date", "Value"]], info
 
     except Exception as e:
@@ -125,7 +161,6 @@ def mm_to_num(code: str) -> int:
     return MONTH_CODES.index(code) + 1
 
 def build_contract_list(root: str, months: int, start_date: date) -> List[Tuple[str, str]]:
-    """Return (contract_code, delivery_label 'YYYY-MM') for next `months` months."""
     out: List[Tuple[str, str]] = []
     y = start_date.year
     m = start_date.month
@@ -140,7 +175,6 @@ def build_contract_list(root: str, months: int, start_date: date) -> List[Tuple[
     return out
 
 def try_yahoo_contract(symbol_base: str) -> pd.Series:
-    """Try a couple of Yahoo suffixes for a futures contract; return last Close if found."""
     candidates = [symbol_base, f"{symbol_base}.NYM"]  # NYMEX suffix often works for CL/NG
     for t in candidates:
         try:
@@ -194,8 +228,8 @@ with st.sidebar.expander("API Keys", expanded=False):
 
 # ====================== EIA (Daily) ======================
 if tab_choice == "EIA (Daily)":
-    st.title("EIA Daily — 3-Year History & Strips")
-    st.caption("Source: U.S. EIA Open Data API")
+    st.title("EIA Daily — 3-Year History & Strips (v2)")
+    st.caption("Source: U.S. EIA Open Data API v2")
 
     c1, c2 = st.columns([2,1])
     with c1:
@@ -208,7 +242,7 @@ if tab_choice == "EIA (Daily)":
         default_window = st.checkbox("Use last 3 years", value=True)
 
     if series_mode == "Custom (enter EIA series ID)":
-        custom_series = st.text_input("EIA series ID", value="", placeholder="e.g., PET.RWTC.D")
+        custom_series = st.text_input("EIA series ID (v1-style OK)", value="", placeholder="e.g., PET.RWTC.D")
         series_id = custom_series.strip()
         series_label = series_id or "Custom"
     else:
@@ -216,11 +250,11 @@ if tab_choice == "EIA (Daily)":
         series_label = series_mode
 
     start_dt, end_dt = (THREE_YEARS_AGO, TODAY) if default_window else st.date_input(
-        "Date range (daily)", (THREE_YEARS_AGO, TODAY)
+        "Date range", (THREE_YEARS_AGO, TODAY)
     )
 
     # Fetch with diagnostics
-    with st.spinner("Fetching EIA daily data…"):
+    with st.spinner("Fetching EIA data (v2)…"):
         df_eia, eia_info = fetch_eia_series_daily(series_id, EIA_KEY, start_dt, end_dt)
     has_data = not df_eia.empty
 
@@ -236,7 +270,7 @@ if tab_choice == "EIA (Daily)":
         })
 
     if st.button("Run EIA connectivity test (WTI daily)"):
-        test_series = "PET.RWTC.D"  # WTI Cushing spot daily
+        test_series = "PET.RWTC.D"
         test_df, test_info = fetch_eia_series_daily(test_series, EIA_KEY, THREE_YEARS_AGO, TODAY)
         st.write("Test result:", {
             "ok": test_info.get("ok"),
@@ -255,7 +289,7 @@ if tab_choice == "EIA (Daily)":
         fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
-        with st.expander("Data (daily)", expanded=False):
+        with st.expander("Data", expanded=False):
             st.dataframe(df_eia, use_container_width=True)
             st.download_button(
                 "Download CSV",
@@ -264,13 +298,12 @@ if tab_choice == "EIA (Daily)":
                 mime="text/csv",
             )
     else:
-        st.warning("No EIA data returned. Check key/series/date window — see Diagnostics above.")
+        st.warning("No EIA rows returned. Check date window/series frequency — see Diagnostics above.")
 
-    # -------- Strip Builder (daily averages over chosen window) --------
+    # -------- Strip Builder (daily/monthly averages over window) --------
     st.markdown("---")
-    st.subheader("Strip Builder (Daily averages)")
+    st.subheader("Strip Builder (Average over selected window)")
 
-    # Helper: end-of-month
     def end_of_month(d: date) -> date:
         return (pd.Timestamp(d) + pd.offsets.MonthEnd(0)).date()
 
@@ -289,9 +322,9 @@ if tab_choice == "EIA (Daily)":
 
     elif strip_type == "3 Month":
         anchor = st.date_input("Anchor (first month of strip)", value=date(latest_date.year, latest_date.month, 1), key="strip3m_eia")
-        end_mo = anchor + relativedelta(months=2)
+        end_mo = (pd.Timestamp(anchor) + pd.offsets.MonthEnd(2)).date()
         start_strip = date(anchor.year, anchor.month, 1)
-        end_strip = end_of_month(date(end_mo.year, end_mo.month, 1))
+        end_strip = end_mo
 
     elif strip_type == "Seasonal":
         season_name = st.radio("Season", ["Summer (Apr–Oct)", "Winter (Nov–Mar)"], horizontal=True)
@@ -312,17 +345,15 @@ if tab_choice == "EIA (Daily)":
         default_start = latest_date.replace(day=1)
         start_strip, end_strip = st.date_input("Custom strip window", (default_start, latest_date), key="stripcustom_eia")
 
-    # Compute strip average (only if data exists)
     if has_data:
         mask = (df_eia["Date"].dt.date >= start_strip) & (df_eia["Date"].dt.date <= end_strip)
         sub = df_eia.loc[mask, "Value"].dropna()
         if sub.empty:
-            st.info("No daily points inside the selected strip window.")
+            st.info("No points inside the selected strip window.")
         else:
             avg = float(sub.mean())
             st.success(f"Strip: {start_strip.isoformat()} → {end_strip.isoformat()}  •  **Average: {avg:,.4f}**")
 
-            # Monthly breakdown
             df_in = df_eia.loc[mask].copy()
             df_in["YearMonth"] = df_in["Date"].dt.to_period("M").astype(str)
             monthly = df_in.groupby("YearMonth")["Value"].mean().reset_index()
@@ -351,7 +382,6 @@ else:
         st.warning("No contract data returned. Try fewer months or a different commodity.")
         st.stop()
 
-    # Curve chart & table
     fig = px.line(
         curve, x="Delivery", y="Price",
         markers=True,
@@ -371,7 +401,6 @@ else:
             mime="text/csv",
         )
 
-    # -------- Forward Curve Strip Builder (curve-average) --------
     st.markdown("---")
     st.subheader("Forward Curve — Strip Builder")
 
@@ -416,7 +445,7 @@ else:
         else:
             selected_deliveries = []
 
-    else:  # Custom Month Range
+    else:
         c1, c2 = st.columns(2)
         with c1:
             start_lab = st.selectbox("Start delivery", deliveries_all, index=0)
@@ -446,4 +475,4 @@ else:
 
 # ---------------- FOOTER ----------------
 st.markdown("---")
-st.caption("© Market Analytics Dashboard — Informational only. Sources: EIA Open Data, Yahoo Finance.")
+st.caption("© Market Analytics Dashboard — Informational only. Sources: EIA Open Data v2, Yahoo Finance.")
