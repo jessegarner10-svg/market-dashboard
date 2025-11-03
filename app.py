@@ -241,8 +241,8 @@ def collar_candidates_for_expiry(
         return None
 
     # Cartesian join (efficient enough for typical strike counts)
-    df_puts = df_puts.rename(columns={strike_col:"Kp", put_col:"P"}).loc[:, ["Kp","P"]]
-    df_calls = df_calls.rename(columns={strike_col:"Kc", call_col:"C"]).loc[:, ["Kc","C"]]
+    df_puts  = df_puts.rename(columns={strike_col:"Kp", put_col:"P"}).loc[:, ["Kp","P"]]
+    df_calls = df_calls.rename(columns={strike_col:"Kc", call_col:"C"}).loc[:, ["Kc","C"]]
     cand = df_puts.merge(df_calls, how="cross")
 
     # width & costless metrics
